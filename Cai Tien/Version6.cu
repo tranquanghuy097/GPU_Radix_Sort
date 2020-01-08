@@ -58,6 +58,117 @@ struct GpuTimer
     }
 };
 
+__device__  int plus_scan(int *x)
+{
+    int i = threadIdx.x; // id of thread executing this instance
+    int n = blockDim.x;  // total number of threads in this block
+    int offset;          // distance between elements to be added
+
+    for( offset = 1; offset < n; offset *= 2) {
+        int t;
+
+        if ( i >= offset ) 
+            t = x[i-offset];
+        
+        __syncthreads();
+
+        if ( i >= offset ) 
+            x[i] = t + x[i]; 
+
+        __syncthreads();
+    }
+    return x[i];
+}
+
+__device__ void partition_by_bit(int *values, int bit)
+{
+    int thread = threadIdx.x;
+    int size = blockDim.x;
+    int x_i = values[thread];          
+    int p_i = (x_i >> bit) & 1; 
+
+    values[thread] = p_i;  
+    __syncthreads();
+
+    int T_before = plus_scan(values);
+    int T_total  = values[size-1];
+
+    int F_total  = size - T_total;
+    __syncthreads();
+    if ( p_i )
+    {
+        values[T_before-1 + F_total] = x_i;
+    }
+    else
+    {
+        values[thread - T_before] = x_i;
+    }  
+}
+
+__device__ void radix_sort(int *values, int nBits, int begin)
+{
+    int  bit;
+    int size = nBits + begin;
+    for( bit = begin; bit < size; ++bit )
+    {
+        partition_by_bit(values, bit);
+        __syncthreads();
+    }
+}
+
+__global__ void sortBlk(int *in, int n, int *sortedBlocks, int bit, int nBins)
+{
+    extern __shared__ int s[];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n)
+    {
+        s[threadIdx.x] = (in[i] >> bit) & (nBins - 1);
+    }
+    __syncthreads();
+    radix_sort(s, 32, 0);
+    __syncthreads();
+    if(i < n)
+    {
+        sortedBlocks[i] =  s[threadIdx.x];
+    }
+    __syncthreads();
+}
+
+__global__ void sortBlk2(int *in, int n, int *out, int bit, int nBins, int nBits)
+{
+    extern __shared__ int s[];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n)
+    {
+        s[threadIdx.x] = in[i];
+    }
+    __syncthreads();
+    radix_sort(s, nBits, bit);
+    __syncthreads();
+    if(i < n)
+    {
+        out[i] =  s[threadIdx.x];
+    }
+    __syncthreads();
+}
+
+__global__ void computeHistKernel(int * in, int n, int * hist, int nBins, int gridSize)
+{
+    extern __shared__ int s[];
+	for(int i = threadIdx.x; i < nBins; i += blockDim.x)
+		s[i] = 0;
+	__syncthreads();
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if(i < n)
+	{
+		int bin = in[i];
+		atomicAdd(&s[bin], 1);
+	}
+	__syncthreads();
+	for(int i = threadIdx.x; i < nBins; i += blockDim.x)
+		atomicAdd(&hist[blockIdx.x + i * gridSize], s[i]);
+}
+
 __global__ void scanBlkKernel(int * in, int n, int * out)
 {   
     //TODO
@@ -83,6 +194,25 @@ __global__ void scanBlkKernel(int * in, int n, int * out)
     out[0] = 0;
 }
 
+__global__ void scatterKernel(int * in, int n, int *sortedBlocks, int *histScan, int * out, int gridSize)
+{
+    extern __shared__ int s[];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < n)
+    {
+        s[threadIdx.x] = sortedBlocks[i];
+    }
+    __syncthreads();
+    int before = 0;
+    for(int j = threadIdx.x - 1; j >= 0; j--)
+        if(s[threadIdx.x] == s[j])
+            before++;
+    __syncthreads();
+    int index = blockIdx.x + sortedBlocks[i] * gridSize;
+    int rank = histScan[index] + before;
+    out[rank] = in[i];
+}
+
 __global__ void computeHistKernel2(int * src, int n, int * hist, int nBins, int bit)
 {
     // TODO
@@ -103,163 +233,15 @@ __global__ void computeHistKernel2(int * src, int n, int * hist, int nBins, int 
 		atomicAdd(&hist[i], s[i]);
 }
 
-void sortDigit(int * in, int n, 
-    int * out, 
-    int nBits, int * blockSizes)
-{
-    // TODO
-    int nBins = 1 << nBits; // 2^nBits
-    int * hist = (int *)malloc(nBins * sizeof(int));
-    int * histScan = (int *)malloc(nBins * sizeof(int));
-
-    int *src = (int *)malloc(n * sizeof(int));
-    memcpy(src, in, n * sizeof(int));
-    int *originalSrc = src; // Use originalSrc to free memory later
-    int * dst = out;
-    int * temp;
-
-    dim3 blockSize1(blockSizes[0]);
-    dim3 blockSize2(blockSizes[1]);
-
-    // Allocate device memories
-    int  * d_hist, *d_histScan, * d_in;
-    CHECK(cudaMalloc(&d_in, n * sizeof(int)));
-    CHECK(cudaMalloc(&d_hist, nBins * sizeof(int)));
-    CHECK(cudaMalloc(&d_histScan, nBins * sizeof(int)));
-
-    // Call kernel
-    dim3 gridSize1((n - 1) / blockSize1.x + 1);
-    dim3 gridSize2((n - 1) / blockSize2.x + 1);
-
-    size_t smemSize = nBins*sizeof(int);
-    size_t sharedMemorySizeByte = blockSize2.x * sizeof(int);
-
-    for (int bit = 0; bit < sizeof(int) * 8; bit += nBits)
-    {
-        // TODO: Compute "hist" of the current digit
-        CHECK(cudaMemcpy(d_in, src, n * sizeof(int), cudaMemcpyHostToDevice));
-
-        CHECK(cudaMemset(d_hist, 0, nBins * sizeof(int)));
-            
-        computeHistKernel2<<<gridSize1, blockSize1, smemSize>>>(d_in, n, d_hist, nBins, bit);
-
-        // TODO: Scan "hist" (exclusively) and save the result to "histScan"
-        scanBlkKernel<<<gridSize2, blockSize2, sharedMemorySizeByte>>>(d_hist, nBins, d_histScan);
-        CHECK(cudaMemcpy(hist, d_histScan, nBins * sizeof(int), cudaMemcpyDeviceToHost));
-
-        // TODO: From "histScan", scatter elements in "src" to correct locations in "dst"
-        for(int i = 0; i < n; i++)
-        {
-            int bin = (src[i] >> bit) & (nBins -1);
-            dst[hist[bin]] = src[i];
-            hist[bin]++;
-        }
-            
-        // TODO: Swap "src" and "dst"
-        temp = src;
-        src = dst;
-        dst = temp;
-    }
-
-    // TODO: Copy result to "out"
-    memcpy(out, src, n * sizeof(uint32_t));
-
-    // Free memories
-    free(hist);
-    free(histScan);
-    free(originalSrc);
-
-    // Free device memories
-    CHECK(cudaFree(d_in));
-    CHECK(cudaFree(d_hist));
-    CHECK(cudaFree(d_histScan));
-}
-
-void sortBit(const uint32_t * in, int n, 
-        uint32_t * out, 
-        int nBits, int * blockSizes, int bit)
-{
-    // TODO
-	int nBins = 1 << nBits; // 2^nBits
-    int * hist = (int *)malloc(nBins * sizeof(int));
-    int * histScan = (int *)malloc(nBins * sizeof(int));
-
-    uint32_t * src = (uint32_t *)malloc(n * sizeof(uint32_t));
-    memcpy(src, in, n * sizeof(uint32_t));
-    uint32_t * originalSrc = src; // Use originalSrc to free memory later
-    uint32_t * dst = out;
-	uint32_t * temp;
-	
-	dim3 blockSize1(blockSizes[0]);
-	dim3 blockSize2(blockSizes[1]);
-	
-    // Allocate device memories
-	int  * d_hist, *d_histScan, * d_in;
-    CHECK(cudaMalloc(&d_in, n * sizeof(int)));
-    CHECK(cudaMalloc(&d_hist, nBins * sizeof(int)));
-    CHECK(cudaMalloc(&d_histScan, nBins * sizeof(int)));
-    
-	// Call kernel
-	dim3 gridSize1((n - 1) / blockSize1.x + 1);
-	dim3 gridSize2((n - 1) / blockSize2.x + 1);
-	
-	size_t smemSize = nBins*sizeof(int);
-	size_t sharedMemorySizeByte = blockSize2.x * sizeof(int);
-    
-    int *d_blkSums;
-    CHECK(cudaMalloc(&d_blkSums, gridSize2.x * sizeof(int)));
-    
-
-    // TODO: Compute "hist" of the current digit
-	CHECK(cudaMemcpy(d_in, src, n * sizeof(int), cudaMemcpyHostToDevice));
-
-	CHECK(cudaMemset(d_hist, 0, nBins * sizeof(int)));
-		
-	computeHistKernel2<<<gridSize1, blockSize1, smemSize>>>(d_in, n, d_hist, nBins, bit);
-
-    // TODO: Scan "hist" (exclusively) and save the result to "histScan"
-    scanBlkKernel<<<gridSize2, blockSize2, sharedMemorySizeByte>>>(d_hist, nBins, d_histScan);
-    CHECK(cudaMemcpy(hist, d_histScan, nBins * sizeof(int), cudaMemcpyDeviceToHost));
-
-    // TODO: From "histScan", scatter elements in "src" to correct locations in "dst"
-	for(int i = 0; i < n; i++)
-	{
-		int bin = (src[i] >> bit) & (nBins -1);
-		dst[hist[bin]] = src[i];
-		hist[bin]++;
-	}
-    	
-    // TODO: Swap "src" and "dst"
-	temp = src;
-	src = dst;
-    dst = temp;
-
-    // TODO: Copy result to "out"
-    memcpy(out, src, n * sizeof(uint32_t));
-    
-    // Free memories
-    free(hist);
-    free(histScan);
-    free(originalSrc);
-
-	// Free device memories
-    CHECK(cudaFree(d_in));
-	CHECK(cudaFree(d_hist));
-    CHECK(cudaFree(d_histScan))
-	CHECK(cudaFree(d_blkSums));
-}
-
 void sortParallel(const uint32_t * in, int n, 
     uint32_t * out, 
     int nBits, int * blockSizes)
 {
 // TODO
     int nBins = 1 << nBits; // 2^nBits
-    int *sortedBlocks = (int *)malloc(n * sizeof(int));
 
     uint32_t * src = (uint32_t *)malloc(n * sizeof(uint32_t));
     memcpy(src, in, n * sizeof(uint32_t));
-    uint32_t * k = (uint32_t *)malloc(n * sizeof(uint32_t));
     uint32_t * originalSrc = src; // Use originalSrc to free memory later
     uint32_t * dst = out;
     uint32_t * temp;
@@ -267,20 +249,30 @@ void sortParallel(const uint32_t * in, int n,
     dim3 blockSize1(blockSizes[0]);
     dim3 blockSize2(blockSizes[1]);
 
+    // Allocate device memories
+    int  * d_hist, *d_histScan, * d_in, *d_sortedBlocks, *d_out, *d_k;
+    CHECK(cudaMalloc(&d_in, n * sizeof(int)));
+    CHECK(cudaMalloc(&d_out, n * sizeof(int)));
+    CHECK(cudaMalloc(&d_sortedBlocks, n * sizeof(int)));
+    CHECK(cudaMalloc(&d_k, n * sizeof(int)));
+
     // Call kernel
     dim3 gridSize1((n - 1) / blockSize1.x + 1);
+    dim3 gridSize2((n - 1) / blockSize2.x + 1);
+
+    CHECK(cudaMalloc(&d_hist, nBins * gridSize1.x * sizeof(int)));
+    CHECK(cudaMalloc(&d_histScan, nBins * gridSize1.x * sizeof(int)));
+
+    size_t smemSize = blockSize1.x*sizeof(int);
+    size_t smemSizeHist = nBins*sizeof(int);
+
+    cudaStream_t stream1, stream2;
+    cudaStreamCreate(&stream1);
+    cudaStreamCreate(&stream2);
 
     int * hist = (int *)malloc(nBins * gridSize1.x * sizeof(int));
     int * histScan = (int *)malloc(nBins * gridSize1.x * sizeof(int));
-
-    uint32_t *block = (uint32_t *)malloc(blockSize1.x * sizeof(int));
-    uint32_t *block2 = (uint32_t *)malloc(blockSize1.x * sizeof(int));
-    int *bitBlock = (int *)malloc(n * sizeof(int));
-    int *bitBlock2 = (int *)malloc(n * sizeof(int));
-    int m = 0;
-    int mul;
     
-
     GpuTimer timer; 
     int i = 0;
        
@@ -288,40 +280,18 @@ void sortParallel(const uint32_t * in, int n,
     {
         printf("%d: \n", i);
         timer.Start();
-        for(int j = 0; j < n; j++)
-        {
-            block[m] = src[j];
-            bitBlock[m] = (src[j] >> bit) & (nBins - 1);
-            m++;
-            if((j + 1) % blockSize1.x == 0)
-            {
-                m = 0;
-                sortBit(block, blockSize1.x, block2, nBits, blockSizes, bit);
-                sortDigit(bitBlock, blockSize1.x, bitBlock2, nBits, blockSizes);
-                mul = (j + 1) / blockSize1.x;
-                for(int l = j + 1 - blockSize1.x; l < mul * blockSize1.x; l++)
-                {
-                    k[l] = block2[m];
-                    sortedBlocks[l] = bitBlock2[m];
-                    m++;
-                }
-                m = 0;
-            }
-        }
+        CHECK(cudaMemcpy(d_in, src, n * sizeof(int), cudaMemcpyHostToDevice));
+        sortBlk<<<gridSize1, blockSize1, smemSize, stream1>>>(d_in, n, d_sortedBlocks, bit, nBins);
+        sortBlk2<<<gridSize1, blockSize1, smemSize, stream2>>>(d_in, n, d_k, bit, nBins, nBits);
+        cudaDeviceSynchronize();
         timer.Stop();
         printf("Sort block: %.3f ms\n", timer.Elapsed());
-       
         // TODO: Compute "hist" of the current digit
 
         timer.Start();
-        memset(hist, 0, nBins * gridSize1.x * sizeof(int));
-        int blockIdx = 0;
-        for (int j = 0; j < n; j++)
-        {
-            hist[blockIdx + sortedBlocks[j] * gridSize1.x]++;
-            if((j + 1) % blockSize1.x == 0)
-                blockIdx++;
-        }
+        CHECK(cudaMemset(d_hist, 0, nBins * gridSize1.x * sizeof(int)));
+        computeHistKernel<<<gridSize1, blockSize1, smemSizeHist>>>(d_sortedBlocks, n, d_hist, nBins, gridSize1.x);
+        CHECK(cudaMemcpy(hist, d_hist, nBins * gridSize1.x * sizeof(int), cudaMemcpyDeviceToHost));
         timer.Stop();
         printf("Hist: %.3f ms\n", timer.Elapsed());
 
@@ -330,27 +300,14 @@ void sortParallel(const uint32_t * in, int n,
         histScan[0] = 0;
         for (int bin = 1; bin < nBins * gridSize1.x; bin++)
             histScan[bin] = histScan[bin - 1] + hist[bin - 1];
+        CHECK(cudaMemcpy(d_histScan, histScan, nBins * gridSize1.x * sizeof(int), cudaMemcpyHostToDevice));
         timer.Stop();
         printf("Scan: %.3f ms\n", timer.Elapsed());
         
         // TODO: From "histScan", scatter elements in "src" to correct locations in "dst"
         timer.Start();
-        blockIdx = 0;
-        for(int q = 0; q < n; q++)
-        {
-            int before = 0;
-            int v = blockIdx * blockSize1.x;
-            int t = q - 1;
-            for(; t >= v; t--)
-            {
-                if(sortedBlocks[q] == sortedBlocks[t])
-                    before++;
-            }
-            int rank = histScan[blockIdx + sortedBlocks[q] * gridSize1.x] + before;
-            dst[rank] = k[q];
-            if((q + 1) % blockSize1.x == 0)
-                blockIdx++;
-        }
+        scatterKernel<<<gridSize1, blockSize1, smemSize>>>(d_k, n, d_sortedBlocks, d_histScan, d_out, gridSize1.x);
+        CHECK(cudaMemcpy(dst, d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
         timer.Stop();
         printf("Scatter: %.3f ms\n", timer.Elapsed());
         
@@ -365,24 +322,22 @@ void sortParallel(const uint32_t * in, int n,
     memcpy(out, src, n * sizeof(uint32_t));
 
     // Free memories
+    free(originalSrc);
     free(hist);
     free(histScan);
-    free(originalSrc);
-    free(sortedBlocks);
-    free(block);
-    free(block2);
-    free(bitBlock);
-    free(bitBlock2);
+
+    cudaStreamDestroy(stream1);
+    cudaStreamDestroy(stream2);
+
+    // Free device memories
+    CHECK(cudaFree(d_in));
+    CHECK(cudaFree(d_out));
+    CHECK(cudaFree(d_hist));
+    CHECK(cudaFree(d_histScan));
+    CHECK(cudaFree(d_sortedBlocks));
+    CHECK(cudaFree(d_k));
 }
 
-
-
-// (Partially) Parallel radix sort: implement parallel histogram and parallel scan in counting sort
-// Assume: nBits (k in slides) in {1, 2, 4, 8, 16}
-// Why "int * blockSizes"? 
-// Because we may want different block sizes for diffrent kernels:
-//   blockSizes[0] for the histogram kernel
-//   blockSizes[1] for the scan kernel
 void sortByDevice(const uint32_t * in, int n, 
         uint32_t * out, 
         int nBits, int * blockSizes)
@@ -404,7 +359,7 @@ void sort(const uint32_t * in, int n,
 
     if (useDevice == false)
     {
-    	printf("\nRadix sort Satish sequential\n");
+    	printf("\nRadix sort Satish parallel\n");
         sortParallel(in, n, out, nBits, blockSizes);
     }
     else // use device
@@ -440,10 +395,13 @@ void checkCorrectness(uint32_t * out, uint32_t * correctOut, int n)
         if (out[i] != correctOut[i])
         {
             printf("INCORRECT :(\n");
+            printf("%d\n", i);
+            printf("%d\n", out[i]);
+            printf("%d\n", correctOut[i]);
             return;
         }
     }
-    printf("CORRECT :)\n");
+    printf("CORRECT\n");
 }
 
 void printArray(uint32_t * a, int n)
@@ -460,7 +418,6 @@ int main(int argc, char ** argv)
 
     // SET UP INPUT SIZE
     int n = (1 << 14);
-    //n = 10;
     printf("\nInput size: %d\n", n);
 
     // ALLOCATE MEMORIES
@@ -472,7 +429,6 @@ int main(int argc, char ** argv)
     // SET UP INPUT DATA
     for (int i = 0; i < n; i++)
         in[i] = rand();
-    //printArray(in, n);
 
     // SET UP NBITS
     int nBits = 4; // Default
@@ -491,7 +447,7 @@ int main(int argc, char ** argv)
 
     sort(in, n, out, nBits, false, blockSizes);
     //printArray(correctOut, n);
-    
+    	
     // SORT BY DEVICE
     sort(in, n, correctOut, nBits, true, blockSizes);
     checkCorrectness(out, correctOut, n);
