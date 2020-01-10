@@ -196,7 +196,7 @@ int main(int argc, char ** argv)
     printDeviceInfo();
 
     // SET UP INPUT SIZE
-    int n = (1 << 14);
+    int n = (1 << 20);
     //n = 10;
     printf("\nInput size: %d\n", n);
 

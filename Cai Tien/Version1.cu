@@ -136,14 +136,11 @@ __global__ void sortBlk(int *in, int n, int *sortedBlocks, int bit, int nBins)
 
 __global__ void computeHistKernel(int * in, int n, int * hist, int nBins, int gridSize)
 {
-    // TODO
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if(i < n)
 	{
-        int index = blockIdx.x + in[i] * gridSize;
-        if(index < gridSize * nBins)
-            atomicAdd(&hist[index], 1);
-    }
+		atomicAdd(&hist[blockIdx.x + in[i] * gridSize], 1);
+	}
 }
 
 __global__ void scanBlkKernel(int * in, int n, int * out)
@@ -330,19 +327,39 @@ void sortParallel(const uint32_t * in, int n,
     int * histScan = (int *)malloc(nBins * gridSize1.x * sizeof(int));
 
     size_t smemSize = blockSize1.x*sizeof(int);
-    size_t sharedMemorySizeByte = blockSize2.x * sizeof(int);
-       
+
+    uint32_t *block = (uint32_t *)malloc(blockSize1.x * sizeof(int));
+    uint32_t *block2 = (uint32_t *)malloc(blockSize1.x * sizeof(int));
+    int m = 0;
+    int mul;
+    
+
     GpuTimer timer; 
     int i = 0;
-
-    //sizeof(uint32_t) * 8
+       
     for (int bit = 0; bit < sizeof(uint32_t) * 8; bit += nBits)
     {
-        printf("%d:\n", i);
+        printf("%d: \n", i);
         timer.Start();
         CHECK(cudaMemcpy(d_in, src, n * sizeof(int), cudaMemcpyHostToDevice));
         sortBlk<<<gridSize1, blockSize1, smemSize>>>(d_in, n, d_sortedBlocks, bit, nBins);
-        sortBit(src, n, k, nBits, blockSizes, bit);
+        for(int j = 0; j < n; j++)
+        {
+            block[m] = src[j];
+            m++;
+            if((j + 1) % blockSize1.x == 0)
+            {
+                m = 0;
+                sortBit(block, blockSize1.x, block2, nBits, blockSizes, bit);
+                mul = (j + 1) / blockSize1.x;
+                for(int l = j + 1 - blockSize1.x; l < mul * blockSize1.x; l++)
+                {
+                    k[l] = block2[m];
+                    m++;
+                }
+                m = 0;
+            }
+        }
         CHECK(cudaMemcpy(d_k, k, n * sizeof(int), cudaMemcpyHostToDevice));
         timer.Stop();
         printf("Sort block: %.3f ms\n", timer.Elapsed());
@@ -358,13 +375,14 @@ void sortParallel(const uint32_t * in, int n,
 
         //TODO: Scan "hist" (exclusively) and save the result to "histScan"
         timer.Start();
-        scanBlkKernel<<<gridSize2, blockSize2, sharedMemorySizeByte>>>(d_hist, nBins * gridSize1.x, d_histScan);
-        CHECK(cudaMemcpy(histScan, d_histScan, nBins * gridSize1.x * sizeof(int), cudaMemcpyDeviceToHost));
+        histScan[0] = 0;
+        for (int bin = 1; bin < nBins * gridSize1.x; bin++)
+            histScan[bin] = histScan[bin - 1] + hist[bin - 1];
+        CHECK(cudaMemcpy(d_histScan, histScan, nBins * gridSize1.x * sizeof(int), cudaMemcpyHostToDevice));
         timer.Stop();
         printf("Scan: %.3f ms\n", timer.Elapsed());
         
         // TODO: From "histScan", scatter elements in "src" to correct locations in "dst"
-        timer.Start();
         scatterKernel<<<gridSize1, blockSize1, smemSize>>>(d_k, n, d_sortedBlocks, d_histScan, d_out, gridSize1.x);
         CHECK(cudaMemcpy(dst, d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
         timer.Stop();
@@ -381,10 +399,9 @@ void sortParallel(const uint32_t * in, int n,
     memcpy(out, src, n * sizeof(uint32_t));
 
     // Free memories
-    free(hist);
-    free(histScan);
     free(originalSrc);
-    free(k);
+    free(block);
+    free(block2);
 
     // Free device memories
     CHECK(cudaFree(d_in));
@@ -392,6 +409,7 @@ void sortParallel(const uint32_t * in, int n,
     CHECK(cudaFree(d_hist));
     CHECK(cudaFree(d_histScan));
     CHECK(cudaFree(d_sortedBlocks));
+    CHECK(cudaFree(d_k));
 }
 
 
@@ -423,7 +441,7 @@ void sort(const uint32_t * in, int n,
 
     if (useDevice == false)
     {
-    	printf("\nRadix sort parallel scan hist\n");
+    	printf("\nRadix sort Satish parallel\n");
         sortParallel(in, n, out, nBits, blockSizes);
     }
     else // use device
@@ -459,8 +477,9 @@ void checkCorrectness(uint32_t * out, uint32_t * correctOut, int n)
         if (out[i] != correctOut[i])
         {
             printf("INCORRECT :(\n");
-            printf("out[%d] = %d", i, out[i]);
-            printf("\ncorrectOut[%d] = %d", i, correctOut[i]);
+            printf("%d\n", i);
+            printf("%d\n", out[i]);
+            printf("%d\n", correctOut[i]);
             return;
         }
     }
@@ -480,7 +499,8 @@ int main(int argc, char ** argv)
     printDeviceInfo();
 
     // SET UP INPUT SIZE
-    int n = 512;
+    int n = (1 << 20);
+    //n = 16384;
     //n = 10;
     printf("\nInput size: %d\n", n);
 
